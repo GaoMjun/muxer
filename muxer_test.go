@@ -131,8 +131,9 @@ func server() {
 
 func handleConn(conn net.Conn) {
 	var (
-		err   error
-		muxer = New(conn)
+		err    error
+		muxer  = New(conn)
+		stream *Stream
 	)
 	defer func() {
 		conn.Close()
@@ -142,7 +143,10 @@ func handleConn(conn net.Conn) {
 	}()
 
 	for {
-		stream := muxer.AcceptStream()
+		if stream, err = muxer.AcceptStream(); err != nil {
+			return
+		}
+
 		go handleStream(stream)
 	}
 }

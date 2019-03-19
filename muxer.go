@@ -8,6 +8,12 @@ import (
 	"sync"
 )
 
+const (
+	CMD_OPENSTREAM  int = 0
+	CMD_CLOSESTREAM int = 1
+	CMD_DATASTREAM      = 2
+)
+
 type Muxer struct {
 	conn io.ReadWriter
 
@@ -20,6 +26,8 @@ type Muxer struct {
 	dataOutCh chan []byte
 
 	streamCh chan *Stream
+
+	end chan error
 }
 
 func New(conn io.ReadWriter) (muxer *Muxer) {
@@ -29,8 +37,9 @@ func New(conn io.ReadWriter) (muxer *Muxer) {
 	muxer.idsnoused = map[int]int{}
 	muxer.streams = map[int]*Stream{}
 	muxer.locker = &sync.RWMutex{}
-	muxer.dataOutCh = make(chan []byte)
+	muxer.dataOutCh = make(chan []byte, 32)
 	muxer.streamCh = make(chan *Stream)
+	muxer.end = make(chan error)
 
 	go muxer.readLoop()
 	go muxer.writeLoop()
@@ -49,20 +58,36 @@ func (self *Muxer) OpenStream() (stream *Stream, err error) {
 	}
 
 	stream = newStream(id, self)
+	stream.sendClose = true
 
 	self.streams[id] = stream
 	return
 }
 
-func (self *Muxer) AcceptStream() (stream *Stream) {
-	stream = <-self.streamCh
+func (self *Muxer) AcceptStream() (stream *Stream, err error) {
+	select {
+	case err = <-self.end:
+	case stream = <-self.streamCh:
+		stream.sendClose = false
+	}
+
 	return
 }
 
+func (self *Muxer) Wait() {
+	<-self.end
+}
+
 func (self *Muxer) writeLoop() {
+	var (
+		err error
+	)
+	defer func() {
+		self.end <- err
+	}()
+
 	for data := range self.dataOutCh {
 		if _, err := self.conn.Write(data); err != nil {
-			log.Println(err)
 			return
 		}
 	}
@@ -77,9 +102,7 @@ func (self *Muxer) readLoop() {
 		stream   *Stream
 	)
 	defer func() {
-		if err != nil {
-			log.Println(err)
-		}
+		self.end <- err
 	}()
 
 	for {
@@ -108,22 +131,27 @@ func (self *Muxer) readLoop() {
 			return
 		}
 		cmd = int(buffer[0])
+
 		switch cmd {
-		case 0: // open stream
+		case CMD_OPENSTREAM: // open stream
 			if stream == nil {
 				if stream, err = self.OpenStream(); err != nil {
 					log.Println(err)
+					break
 				}
 
-				self.streamCh <- stream
+				go func() {
+					self.streamCh <- stream
+				}()
+
 			}
-		case 1: // close stream
+		case CMD_CLOSESTREAM: // close stream
 			if stream != nil {
-				close(stream.dataInCh)
-				stream.closed = true
-				self.delStream(stream.ID)
+				stream.Close()
 			}
 			continue
+		case CMD_DATASTREAM:
+
 		default:
 			err = errors.New("parsing cmd failed")
 			return
@@ -135,15 +163,18 @@ func (self *Muxer) readLoop() {
 			return
 		}
 		length = int(buffer[0])<<8 | int(buffer[1])
+		log.Println("readLoop", cmd, length)
 
-		if stream != nil && length > 0 {
+		if length > 0 {
 			// read data
 			buffer = make([]byte, length)
 			if _, err = io.ReadFull(self.conn, buffer); err != nil {
 				return
 			}
 
-			stream.dataInCh <- buffer
+			if stream != nil {
+				stream.Feed(buffer)
+			}
 		}
 	}
 }

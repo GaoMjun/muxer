@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"sync"
 )
 
 type Stream struct {
@@ -11,55 +12,40 @@ type Stream struct {
 	ID    int
 	cmd   int
 
-	dataInCh chan []byte
-	buffer   []byte
+	dataBuffer *buffer
 
-	closed bool
+	closed    bool
+	locker    *sync.RWMutex
+	sendClose bool
+
+	firstFrame bool
 }
 
 func newStream(id int, muxer *Muxer) (stream *Stream) {
 	stream = &Stream{}
 	stream.ID = id
 	stream.muxer = muxer
-	stream.dataInCh = make(chan []byte)
+	stream.dataBuffer = newBuffer()
+	stream.locker = &sync.RWMutex{}
+	stream.firstFrame = true
 	return
 }
 
+func (self *Stream) Feed(p []byte) {
+	self.dataBuffer.write(p)
+}
+
 func (self *Stream) Read(p []byte) (n int, err error) {
-	if len(self.buffer) > 0 {
-		if len(p) >= len(self.buffer) {
-			n = copy(p, self.buffer)
-			self.buffer = nil
-			return
-		}
-
-		n = copy(p, self.buffer)
-		self.buffer = self.buffer[n:]
-		return
-	}
-
-	var (
-		data []byte
-		ok   bool
-	)
-	if data, ok = <-self.dataInCh; !ok {
-		self.closed = true
-		err = io.ErrUnexpectedEOF
-		return
-	}
-
-	if len(p) >= len(data) {
-		n = copy(p, data)
-		return
-	}
-
-	n = copy(p, data)
-	self.buffer = data[n:]
+	n, err = self.dataBuffer.Read(p)
 	return
 }
 
 func (self *Stream) Write(p []byte) (n int, err error) {
-	if self.closed {
+	self.locker.RLock()
+	closed := self.closed
+	self.locker.RUnlock()
+
+	if closed {
 		err = io.ErrClosedPipe
 		return
 	}
@@ -72,6 +58,12 @@ func (self *Stream) Write(p []byte) (n int, err error) {
 			length = int(^uint16(0))
 		}
 
+		if self.firstFrame {
+			self.firstFrame = false
+			self.cmd = CMD_OPENSTREAM
+		} else {
+			self.cmd = CMD_DATASTREAM
+		}
 		if _, err = self.writeFrame(p[offset : offset+length]); err != nil {
 			return
 		}
@@ -84,18 +76,24 @@ func (self *Stream) Write(p []byte) (n int, err error) {
 }
 
 func (self *Stream) Close() (err error) {
+	self.locker.Lock()
 	if self.closed {
+		self.locker.Unlock()
 		return
 	}
-
-	close(self.dataInCh)
 	self.closed = true
-	self.cmd = 1
-	if _, err = self.writeFrame(nil); err != nil {
-		return
+	self.locker.Unlock()
+
+	if self.sendClose {
+		self.cmd = CMD_CLOSESTREAM
+		if _, err = self.writeFrame(nil); err != nil {
+			return
+		}
 	}
 
 	self.muxer.delStream(self.ID)
+
+	self.dataBuffer.eof()
 	return
 }
 
@@ -103,7 +101,6 @@ func (self *Stream) writeFrame(p []byte) (n int, err error) {
 	buffer := &bytes.Buffer{}
 
 	// write signature
-
 	if err = binary.Write(buffer, binary.LittleEndian, []byte("mux")); err != nil {
 		return
 	}
